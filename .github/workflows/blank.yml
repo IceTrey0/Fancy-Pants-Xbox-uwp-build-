@@ -1,0 +1,104 @@
+
+name: Build Xbox UWP package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v4
+
+      - name: Extract project ZIP
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem "$env:GITHUB_WORKSPACE" -Filter "*.zip" | Select-Object -First 1
+          if (-not $zip) { throw "Project ZIP not found." }
+          Expand-Archive $zip.FullName "$env:RUNNER_TEMP\source" -Force
+          $project = "$env:RUNNER_TEMP\source\FancyPantsXbox"
+          if (-not (Test-Path "$project\FancyPantsXbox.csproj")) {
+            throw "UWP project file not found inside ZIP."
+          }
+          "PROJECT_DIR=$project" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Download Ruffle Flash runtime
+        shell: pwsh
+        run: |
+          $release = Invoke-RestMethod `
+            "https://api.github.com/repos/ruffle-rs/ruffle/releases/latest"
+          $asset = $release.assets |
+            Where-Object { $_.name -match 'web-selfhosted.*\.zip$' } |
+            Select-Object -First 1
+          if (-not $asset) { throw "Ruffle ZIP not found." }
+          Invoke-WebRequest $asset.browser_download_url `
+            -OutFile "$env:RUNNER_TEMP\ruffle.zip"
+          Expand-Archive "$env:RUNNER_TEMP\ruffle.zip" `
+            "$env:RUNNER_TEMP\ruffle-files" -Force
+          $js = Get-ChildItem "$env:RUNNER_TEMP\ruffle-files" `
+            -Recurse -Filter "ruffle.js" | Select-Object -First 1
+          if (-not $js) { throw "Ruffle JavaScript not found." }
+          New-Item "$env:PROJECT_DIR\ruffle" -ItemType Directory -Force | Out-Null
+          Copy-Item "$($js.Directory.FullName)\*" `
+            "$env:PROJECT_DIR\ruffle" -Recurse -Force
+
+      - name: Build UWP package
+        shell: pwsh
+        run: |
+          $msbuild = Get-ChildItem `
+            "C:\Program Files\Microsoft Visual Studio" `
+            -Recurse -Filter MSBuild.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\MSBuild\\Current\\Bin\\MSBuild.exe$' } |
+            Select-Object -First 1
+          if (-not $msbuild) { throw "MSBuild not found." }
+          & $msbuild.FullName "$env:PROJECT_DIR\FancyPantsXbox.csproj" `
+            /restore /m /p:Configuration=Release /p:Platform=x64 `
+            /p:AppxPackageSigningEnabled=false `
+            /p:UapAppxPackageBuildMode=SideloadOnly
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Collect package
+        shell: pwsh
+        run: |
+          $pkg = Get-ChildItem "$env:PROJECT_DIR" -Recurse `
+            -Include *.appxbundle,*.appx |
+            Where-Object { $_.FullName -match 'AppPackages' } |
+            Select-Object -First 1
+          if (-not $pkg) { throw "No APPX package produced." }
+          $cert = New-SelfSignedCertificate `
+            -Type Custom -Subject "CN=FancyPantsXboxDev" `
+            -KeyUsage DigitalSignature `
+            -CertStoreLocation "Cert:\CurrentUser\My"
+          $pwd = ConvertTo-SecureString "TempBuildOnly-8391!" `
+            -Force -AsPlainText
+          Export-PfxCertificate $cert `
+            "$env:RUNNER_TEMP\signing.pfx" -Password $pwd | Out-Null
+          Export-Certificate $cert `
+            "$env:GITHUB_WORKSPACE\FancyPantsXboxDev.cer" | Out-Null
+          $signtool = Get-ChildItem `
+            "C:\Program Files (x86)\Windows Kits\10\bin" `
+            -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match '\\x64\\signtool.exe$' } |
+            Select-Object -First 1
+          if (-not $signtool) { throw "SignTool not found." }
+          & $signtool.FullName sign /fd SHA256 `
+            /f "$env:RUNNER_TEMP\signing.pfx" `
+            /p "TempBuildOnly-8391!" $pkg.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item $pkg.FullName `
+            "$env:GITHUB_WORKSPACE\FancyPantsXbox.appxbundle"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FancyPantsXbox-Xbox-DevMode
+          path: |
+            FancyPantsXbox.appxbundle
+            FancyPantsXboxDev.cer
